@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import threading
+import traceback
 from typing import Callable, Optional
 
 from backend.common import constants as C
@@ -34,6 +35,10 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, dict[str, Task]] = {}
         self._lock = threading.RLock()
+        # Invoked right after a job enters CANCELLED/FAILED (wired up by the
+        # Master) so the scheduler can stop the job's in-flight tasks on the
+        # workers instead of letting them run on as zombies.
+        self.on_terminal: Optional[Callable[[Job], None]] = None
         self._load()
 
     # ------------------------------------------------------------------
@@ -193,13 +198,53 @@ class JobManager:
     def cancel(self, job: Job) -> Job:
         self.set_job_status(job, C.JOB_CANCELLED)
         self.logbus.warn(job.job_id, "job cancelled", task_id="job")
+        self._notify_terminal(job)
         return job
 
     def fail(self, job: Job, error: str) -> Job:
         job.error = error
         self.set_job_status(job, C.JOB_FAILED)
         self.logbus.error(job.job_id, f"job failed: {error}", task_id="job")
+        self._notify_terminal(job)
         return job
+
+    def _notify_terminal(self, job: Job) -> None:
+        if self.on_terminal is None:
+            return
+        try:
+            self.on_terminal(job)
+        except Exception:  # noqa: BLE001 - cleanup must never break the transition
+            traceback.print_exc()
+
+    def finalize_tasks(self, job_id: str, status: str = C.TASK_CANCELLED,
+                       reason: str = "") -> list[tuple[str, str]]:
+        """Move every non-terminal task of ``job_id`` to a terminal ``status``.
+
+        Returns the ``(task_id, worker_id)`` pairs that were in flight on a
+        worker (including speculative duplicates) so the caller can tell those
+        workers to stop.  Tasks that never left the queue simply flip state —
+        they hold no worker resources.
+        """
+        inflight: list[tuple[str, str]] = []
+        with self._lock:
+            tasks = list(self._tasks.get(job_id, {}).values())
+            for task in tasks:
+                if task.status in C.TASK_TERMINAL_STATES:
+                    continue
+                if task.status in (C.TASK_ASSIGNED, C.TASK_RUNNING):
+                    targets = set((task.stats or {}).get("speculative_workers", []))
+                    if task.worker_id:
+                        targets.add(task.worker_id)
+                    for worker_id in sorted(targets):
+                        inflight.append((task.task_id, worker_id))
+                task.status = status
+                task.retry_after_ms = 0
+                task.finished_ms = now_ms()
+                task.last_update_ms = now_ms()
+                if reason and not task.error:
+                    task.error = reason
+                self.save_task(job_id, task)
+        return inflight
 
     # ------------------------------------------------------------------
     # Derived views
@@ -210,7 +255,8 @@ class JobManager:
         for stage, kind in ((C.STAGE_MAP, C.TASK_MAP), (C.STAGE_REDUCE, C.TASK_REDUCE)):
             stage_tasks = [t for t in tasks if t.kind == kind]
             counts = {C.TASK_PENDING: 0, C.TASK_ASSIGNED: 0, C.TASK_RUNNING: 0,
-                      C.TASK_RETRYING: 0, C.TASK_SUCCEEDED: 0, C.TASK_FAILED: 0}
+                      C.TASK_RETRYING: 0, C.TASK_SUCCEEDED: 0, C.TASK_FAILED: 0,
+                      C.TASK_CANCELLED: 0}
             for t in stage_tasks:
                 counts[t.status] = counts.get(t.status, 0) + 1
             total = len(stage_tasks)

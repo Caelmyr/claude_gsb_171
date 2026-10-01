@@ -55,6 +55,8 @@ class Master:
             self.storage, self.job_manager, self.registry, self.shuffle,
             self.fault_tolerance, self.metrics, self.config, self.logbus,
         )
+        # A job entering CANCELLED/FAILED must stop its tasks on the workers.
+        self.job_manager.on_terminal = self.scheduler.terminate_job_tasks
 
         self.app = Flask("master", static_folder=FRONTEND_DIR, static_url_path="")
         self._register_routes()

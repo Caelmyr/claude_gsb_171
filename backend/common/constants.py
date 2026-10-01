@@ -34,9 +34,11 @@ TASK_RUNNING = "RUNNING"
 TASK_SUCCEEDED = "SUCCEEDED"
 TASK_FAILED = "FAILED"         # permanently failed after max attempts
 TASK_RETRYING = "RETRYING"     # failed, waiting to be re-dispatched
+TASK_CANCELLED = "CANCELLED"   # stopped because its job was cancelled/failed
+# (same literal as JOB_CANCELLED, so STATE_LABELS already covers it)
 
 TASK_ACTIVE_STATES = {TASK_ASSIGNED, TASK_RUNNING, TASK_RETRYING}
-TASK_TERMINAL_STATES = {TASK_SUCCEEDED, TASK_FAILED}
+TASK_TERMINAL_STATES = {TASK_SUCCEEDED, TASK_FAILED, TASK_CANCELLED}
 
 # ---------------------------------------------------------------------------
 # Stage names (also used as directory names in the JSON store)

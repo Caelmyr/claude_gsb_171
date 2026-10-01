@@ -125,6 +125,60 @@ class Scheduler:
         self._maybe_speculate(job)
 
     # ------------------------------------------------------------------
+    # Job termination cleanup (invoked via JobManager.on_terminal)
+    # ------------------------------------------------------------------
+    def terminate_job_tasks(self, job: Job) -> None:
+        """A cancelled/failed job must not leave tasks running on workers.
+
+        State is finalized synchronously (so the UI and the scheduler's
+        capacity accounting are immediately consistent); the cancel RPCs are
+        fanned out on a background thread so a dead worker cannot stall the
+        request/scheduler thread that triggered the termination.
+        """
+        reason = "job cancelled" if job.status == C.JOB_CANCELLED else "job failed"
+        inflight = self.job_manager.finalize_tasks(job.job_id, reason=reason)
+        if not inflight:
+            return
+        by_worker: dict[str, list[str]] = {}
+        for task_id, worker_id in inflight:
+            by_worker.setdefault(worker_id, []).append(task_id)
+        self.logbus.warn(
+            job.job_id,
+            f"job {job.status.lower()}; stopping {len(inflight)} in-flight "
+            f"task(s) on {len(by_worker)} worker(s)",
+            task_id="job",
+        )
+        threading.Thread(
+            target=self._send_task_cancels, args=(job.job_id, by_worker),
+            daemon=True, name=f"job-kill-{job.job_id}",
+        ).start()
+
+    def _send_task_cancels(self, job_id: str, by_worker: dict[str, list[str]]) -> None:
+        for worker_id, task_ids in by_worker.items():
+            worker = self.registry.get(worker_id)
+            if worker is None:
+                continue
+            for task_id in task_ids:
+                self._rpc_cancel(worker, job_id, task_id)
+
+    def _rpc_cancel(self, worker: WorkerRecord, job_id: str, task_id: str) -> None:
+        try:
+            self.client.post(f"{worker.address}/task/cancel",
+                             {"job_id": job_id, "task_id": task_id}, timeout=2.0)
+        except Exception:  # noqa: BLE001 - best effort; see _cancel_stray
+            pass
+
+    def _cancel_stray(self, payload: dict) -> None:
+        """Re-send a cancel to a worker still running a terminal job's task.
+
+        This is the self-healing path for a lost cancel RPC: the worker's next
+        progress/completion report after the job ended triggers a re-send.
+        """
+        worker = self.registry.get(payload.get("worker_id", ""))
+        if worker is not None and worker.is_alive:
+            self._rpc_cancel(worker, payload.get("job_id", ""), payload.get("task_id", ""))
+
+    # ------------------------------------------------------------------
     def _dispatch_tasks(self, job: Job, kind: str) -> None:
         pending = [
             t for t in self.job_manager.tasks_for(job.job_id, kind)
@@ -137,6 +191,10 @@ class Scheduler:
             return
 
         for task in pending:
+            if job.is_terminal:
+                return  # cancelled/failed while we were dispatching
+            if task.status not in (C.TASK_PENDING, C.TASK_RETRYING):
+                continue  # concurrently finalized by job termination
             if task.status == C.TASK_RETRYING and task.retry_after_ms > now_ms():
                 continue  # exponential backoff not yet elapsed
             worker = self._least_loaded(workers, exclude=None)
@@ -192,6 +250,8 @@ class Scheduler:
             return
 
         def mark_dispatched(t: Task) -> None:
+            if t.status in C.TASK_TERMINAL_STATES:
+                return  # the job ended between the accept and this record
             t.status = C.TASK_ASSIGNED
             t.assigned_ms = now_ms()
             if not speculative:
@@ -201,7 +261,13 @@ class Scheduler:
                 stats.setdefault("speculative_workers", []).append(worker.worker_id)
                 t.stats = stats
 
-        self.job_manager.apply_task(job.job_id, task.task_id, mark_dispatched)
+        updated = self.job_manager.apply_task(job.job_id, task.task_id, mark_dispatched)
+        if updated is not None and updated.status in C.TASK_TERMINAL_STATES:
+            # The job was cancelled/failed as we dispatched; the worker has
+            # already started it, so send a compensating cancel right away.
+            self._rpc_cancel(worker, job.job_id, task.task_id)
+            return
+
         self.logbus.info(
             job.job_id,
             f"task {task.task_id} dispatched to {worker.name}" + (" (speculative)" if speculative else ""),
@@ -236,8 +302,12 @@ class Scheduler:
         job = self.job_manager.get_job(payload.get("job_id", ""))
         if job is None:
             return
+        if job.is_terminal:
+            # A task of a finished job is still reporting: its cancel was lost.
+            self._cancel_stray(payload)
+            return
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
-        if task is None or task.status == C.TASK_SUCCEEDED:
+        if task is None or task.status in C.TASK_TERMINAL_STATES:
             return
 
         def apply(t: Task) -> None:
@@ -257,11 +327,23 @@ class Scheduler:
         if job is None:
             return
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
-        if task is None or task.status == C.TASK_SUCCEEDED:
-            return  # duplicate completion from a speculative loser
+        if task is None:
+            return
+        if job.is_terminal or task.status in C.TASK_TERMINAL_STATES:
+            # Late completion for a finished job/task (cancelled, failed, or a
+            # speculative loser): ignore it so terminal state is never
+            # resurrected and no results/metrics are written for a dead job.
+            return
 
         worker_id = payload.get("worker_id", "")
         status = payload.get("status", C.TASK_FAILED)
+
+        if status == C.TASK_CANCELLED:
+            # The worker stopped a task whose job is still active (not a
+            # master-initiated cancel): requeue it rather than burn a retry.
+            self.job_manager.update_task(job.job_id, task.task_id,
+                                         status=C.TASK_PENDING, worker_id=None)
+            return
 
         if status != C.TASK_SUCCEEDED:
             self.registry.task_finished(worker_id, success=False)
@@ -323,7 +405,8 @@ class Scheduler:
             if worker is not None:
                 try:
                     self.client.post(f"{worker.address}/task/cancel",
-                                     {"task_id": task.task_id}, timeout=2.0)
+                                     {"job_id": job.job_id, "task_id": task.task_id},
+                                     timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
 
