@@ -45,6 +45,10 @@ class WorkerRegistry:
         self.storage.write(worker.to_dict(), "registry", "workers", f"{worker.worker_id}.json")
 
     # ------------------------------------------------------------------
+    def save(self, worker: WorkerRecord) -> None:
+        """Persist an in-memory worker record after scheduler reconciliation."""
+        self._save(worker)
+
     def register(self, payload: dict) -> WorkerRecord:
         wid = payload["worker_id"]
         with self._lock:

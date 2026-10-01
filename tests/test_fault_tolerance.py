@@ -53,6 +53,13 @@ class TestFaultTolerance(unittest.TestCase):
         self.assertEqual(len(faults), 1)
         self.assertEqual(faults[0]["kind"], "task_failed")
 
+    def test_late_failure_does_not_resurrect_cancelled_job(self):
+        task = self.jm.tasks_for(self.job.job_id, "map")[0]
+        self.jm.cancel(self.job)
+        self.assertFalse(self.ft.handle_task_failure(self.job, task, "late boom"))
+        self.assertEqual(self.jm.get_job(self.job.job_id).status, "CANCELLED")
+        self.assertEqual(self.jm.get_task(self.job.job_id, task.task_id).status, "CANCELLED")
+
 
 class TestMapReduceCorrectness(unittest.TestCase):
     def test_wordcount_matches_reference(self):

@@ -17,6 +17,7 @@ never race.
 from __future__ import annotations
 
 import threading
+import time
 import traceback
 from typing import Optional
 
@@ -35,6 +36,7 @@ from backend.master.shuffle import ShuffleCoordinator
 
 SHUFFLE_HOLD_MS = 400          # keep the SHUFFLE stage observable for one beat
 MAX_TASKS_PER_WORKER = 3       # concurrency cap per worker
+PENDING_CANCEL_TTL_SEC = 30
 
 
 class Scheduler:
@@ -60,6 +62,8 @@ class Scheduler:
         self.client = HttpClient(timeout=3.0, retries=1)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
+        self._pending_cancels: dict[tuple[str, str, str], float] = {}
+        self.job_manager.on_terminal(self._on_job_terminal)
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -87,7 +91,11 @@ class Scheduler:
                     self.logbus.warn("", f"worker {worker.name} reaped; {count} tasks reassigned",
                                      task_id="cluster")
 
-        # 2. Advance each active job.
+        # 2. Reconcile cancels for jobs which terminated while workers were unreachable.
+        self._reconcile_worker_task_counts()
+        self._retry_pending_cancels()
+
+        # 3. Advance each active job.
         for job in self.job_manager.list_jobs():
             if job.is_terminal:
                 continue
@@ -153,13 +161,36 @@ class Scheduler:
                 out.append(worker)
         return out
 
+    def _reconcile_worker_task_counts(self) -> None:
+        """Make registry counters match the Master's authoritative active tasks."""
+        counts: dict[str, int] = {}
+        for job in self.job_manager.list_jobs():
+            if job.is_terminal:
+                continue
+            for task in self.job_manager.tasks_for(job.job_id):
+                if task.worker_id and task.status in C.TASK_ACTIVE_STATES:
+                    counts[task.worker_id] = counts.get(task.worker_id, 0) + 1
+                # Also count accepted speculative duplicates which share one Task record.
+                for wid in (task.stats or {}).get("speculative_workers", []):
+                    if task.status in C.TASK_ACTIVE_STATES:
+                        counts[wid] = counts.get(wid, 0) + 1
+        for worker in self.registry.all():
+            expected = counts.get(worker.worker_id, 0)
+            if worker.running_tasks != expected:
+                worker.running_tasks = expected
+                self.registry.save(worker)
+
     def _count_running_on(self, worker_id: str) -> int:
         count = 0
         for job in self.job_manager.list_jobs():
             if job.is_terminal:
                 continue
             for task in self.job_manager.tasks_for(job.job_id):
-                if task.worker_id == worker_id and task.status in C.TASK_ACTIVE_STATES:
+                if task.status not in C.TASK_ACTIVE_STATES:
+                    continue
+                if task.worker_id == worker_id:
+                    count += 1
+                if worker_id in (task.stats or {}).get("speculative_workers", []):
                     count += 1
         return count
 
@@ -180,6 +211,7 @@ class Scheduler:
         spec = self._build_spec(job, task)
         if speculative:
             spec["speculative"] = True
+            spec["execution_id"] = f"spec-{worker.worker_id}"
         url = f"{worker.address}/task/execute"
         try:
             resp = self.client.post(url, spec, timeout=4.0)
@@ -191,17 +223,14 @@ class Scheduler:
         if not accepted:
             return
 
-        def mark_dispatched(t: Task) -> None:
-            t.status = C.TASK_ASSIGNED
-            t.assigned_ms = now_ms()
-            if not speculative:
-                t.worker_id = worker.worker_id
-            else:
-                stats = dict(t.stats or {})
-                stats.setdefault("speculative_workers", []).append(worker.worker_id)
-                t.stats = stats
-
-        self.job_manager.apply_task(job.job_id, task.task_id, mark_dispatched)
+        marked = self.job_manager.mark_task_dispatched(
+            job, task, worker, speculative=speculative,
+        )
+        if marked is None:
+            # The job terminated before this dispatch was recorded. Stop the task
+            # that the worker just accepted so it cannot become a zombie.
+            self._request_task_cancel(job.job_id, task.task_id, worker.worker_id)
+            return
         self.logbus.info(
             job.job_id,
             f"task {task.task_id} dispatched to {worker.name}" + (" (speculative)" if speculative else ""),
@@ -217,7 +246,7 @@ class Scheduler:
             "mapper": job.mapper,
             "reducer": job.reducer,
             "params": job.params,
-            "attempt": 0,
+            "attempt": task.attempts,
             "simulate_failure": bool(job.params.get("simulate_failure", False)),
         }
         if task.kind == C.TASK_MAP:
@@ -230,14 +259,94 @@ class Scheduler:
         return spec
 
     # ------------------------------------------------------------------
+    # Job-wide termination / remote cancellation
+    # ------------------------------------------------------------------
+    def _on_job_terminal(self, job: Job, remote_tasks: list[Task]) -> None:
+        """Best-effort kill every worker execution attached to a terminal job."""
+        def cancel_all() -> None:
+            by_worker: dict[str, set[str]] = {}
+            for task in remote_tasks:
+                if task.worker_id:
+                    by_worker.setdefault(task.worker_id, set()).add(task.task_id)
+                for wid in (task.stats or {}).get("speculative_workers", []):
+                    by_worker.setdefault(wid, set()).add(task.task_id)
+
+            for worker_id, task_ids in by_worker.items():
+                if not self._request_job_cancel(job.job_id, worker_id):
+                    for task_id in task_ids:
+                        self._request_task_cancel(job.job_id, task_id, worker_id)
+
+        # Return control to the cancel/fail request immediately; cancellation is
+        # idempotent and the scheduler retries anything that cannot be delivered.
+        threading.Thread(target=cancel_all, daemon=True,
+                         name=f"cancel-{job.job_id}").start()
+
+    def _enqueue_cancel(self, key: tuple[str, str, str]) -> None:
+        self._pending_cancels.setdefault(key, time.monotonic())
+
+    def _request_job_cancel(self, job_id: str, worker_id: str) -> bool:
+        worker = self.registry.get(worker_id)
+        if worker is None:
+            self._enqueue_cancel((job_id, worker_id, ""))
+            return False
+        try:
+            resp = self.client.post(f"{worker.address}/job/{job_id}/cancel", timeout=2.0)
+            if resp.ok and (not isinstance(resp.data, dict) or resp.data.get("cancelled", 0) >= 0):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        self._enqueue_cancel((job_id, worker_id, ""))
+        return False
+
+    def _request_task_cancel(self, job_id: str, task_id: str, worker_id: str) -> bool:
+        worker = self.registry.get(worker_id)
+        if worker is None or not task_id:
+            if task_id:
+                self._enqueue_cancel((job_id, worker_id, task_id))
+            return False
+        try:
+            resp = self.client.post(
+                f"{worker.address}/task/cancel",
+                {"job_id": job_id, "task_id": task_id},
+                timeout=2.0,
+            )
+            if resp.ok:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        self._enqueue_cancel((job_id, worker_id, task_id))
+        return False
+
+    def _retry_pending_cancels(self) -> None:
+        now = time.monotonic()
+        for key in list(self._pending_cancels):
+            job_id, worker_id, task_id = key
+            if now - self._pending_cancels[key] > PENDING_CANCEL_TTL_SEC:
+                self._pending_cancels.pop(key, None)
+                continue
+            if task_id:
+                ok = self._request_task_cancel(job_id, task_id, worker_id)
+            else:
+                ok = self._request_job_cancel(job_id, worker_id)
+            if ok:
+                self._pending_cancels.pop(key, None)
+
+    # ------------------------------------------------------------------
     # Completion / progress handling (invoked from Flask routes)
     # ------------------------------------------------------------------
     def on_task_status(self, payload: dict) -> None:
         job = self.job_manager.get_job(payload.get("job_id", ""))
         if job is None:
             return
+        if job.is_terminal:
+            worker_id = payload.get("worker_id", "")
+            if worker_id:
+                self._request_task_cancel(job.job_id, payload.get("task_id", ""), worker_id)
+            return
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
-        if task is None or task.status == C.TASK_SUCCEEDED:
+        if task is None or task.status in C.TASK_TERMINAL_STATES:
+            if task is not None and payload.get("worker_id"):
+                self._request_task_cancel(job.job_id, task.task_id, payload["worker_id"])
             return
 
         def apply(t: Task) -> None:
@@ -250,18 +359,42 @@ class Scheduler:
             t.records_processed = int(payload.get("records_processed", t.records_processed))
             t.records_emitted = int(payload.get("records_emitted", t.records_emitted))
 
-        self.job_manager.apply_task(job.job_id, task.task_id, apply)
+        self.job_manager.apply_task(job.job_id, task.task_id, apply, require_active_job=True)
 
     def on_task_complete(self, payload: dict) -> None:
         job = self.job_manager.get_job(payload.get("job_id", ""))
         if job is None:
             return
         task = self.job_manager.get_task(job.job_id, payload.get("task_id", ""))
-        if task is None or task.status == C.TASK_SUCCEEDED:
-            return  # duplicate completion from a speculative loser
+        if task is None:
+            return
 
         worker_id = payload.get("worker_id", "")
         status = payload.get("status", C.TASK_FAILED)
+
+        if job.is_terminal or task.status in C.TASK_TERMINAL_STATES:
+            # A late report from a killed/speculative task must not resurrect a
+            # terminal task or decrement the worker counters twice.
+            if status not in (C.TASK_SUCCEEDED, C.TASK_CANCELLED) and worker_id:
+                # The worker may not have observed the cancel request yet.
+                self._request_task_cancel(job.job_id, task.task_id, worker_id)
+            elif status == C.TASK_CANCELLED and job.is_terminal:
+                # The worker stopped after the whole-job cancel; the task is already
+                # terminal in JobManager, so only reconcile the worker counter.
+                self.registry.task_finished(worker_id, success=False)
+            return
+
+        if status == C.TASK_CANCELLED:
+            def mark_cancelled(t: Task) -> None:
+                t.status = C.TASK_CANCELLED
+                t.error = str(payload.get("error", "") or "cancelled")
+                t.finished_ms = now_ms()
+            marked = self.job_manager.apply_task(
+                job.job_id, task.task_id, mark_cancelled, require_active_job=True,
+            )
+            if marked is not None:
+                self.registry.task_finished(worker_id, success=False)
+            return
 
         if status != C.TASK_SUCCEEDED:
             self.registry.task_finished(worker_id, success=False)
@@ -283,14 +416,18 @@ class Scheduler:
             stats["winning_worker"] = worker_id
             t.stats = stats
 
-        self.job_manager.apply_task(job.job_id, task.task_id, apply)
+        succeeded = self.job_manager.apply_task(job.job_id, task.task_id, apply,
+                                                require_active_job=True)
+        if succeeded is None:
+            # The job was cancelled or failed while this success report was in flight.
+            return
         self.registry.task_finished(worker_id, success=True)
-        self.metrics.record_task(job, task, int(payload.get("duration_ms", 0)))
+        self.metrics.record_task(job, succeeded, int(payload.get("duration_ms", 0)))
 
-        if task.kind == C.TASK_REDUCE:
-            self._store_results(job, task, payload.get("results", []))
-            self.shuffle.mark_partition_done(job, task.partition,
-                                             task.stats.get("shuffle_bytes", 0))
+        if succeeded.kind == C.TASK_REDUCE:
+            self._store_results(job, succeeded, payload.get("results", []))
+            self.shuffle.mark_partition_done(job, succeeded.partition,
+                                             succeeded.stats.get("shuffle_bytes", 0))
 
         self.logbus.info(
             job.job_id,
@@ -298,7 +435,7 @@ class Scheduler:
             f"{payload.get('duration_ms', 0)} ms)",
             task_id=task.task_id, worker_id=worker_id,
         )
-        self._cancel_speculative_losers(job, task, worker_id)
+        self._cancel_speculative_losers(job, succeeded, worker_id)
 
     def _store_results(self, job: Job, task: Task, results: list) -> None:
         pname = partition_name(task.partition)
@@ -319,13 +456,7 @@ class Scheduler:
         for wid in losers:
             if wid == winner_worker_id:
                 continue
-            worker = self.registry.get(wid)
-            if worker is not None:
-                try:
-                    self.client.post(f"{worker.address}/task/cancel",
-                                     {"task_id": task.task_id}, timeout=2.0)
-                except Exception:  # noqa: BLE001
-                    pass
+            self._request_task_cancel(job.job_id, task.task_id, wid)
 
     # ------------------------------------------------------------------
     def _finish_success(self, job: Job) -> None:

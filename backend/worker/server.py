@@ -3,7 +3,8 @@
 A Worker exposes a small HTTP surface that the Master drives:
 
 * ``POST /task/execute``  — accept a map/reduce task spec and start executing;
-* ``POST /task/cancel``   — best-effort cancellation of a running task;
+* ``POST /task/cancel``   — best-effort cancellation of one running task;
+* ``POST /job/<job>/cancel`` — stop every task belonging to one job;
 * ``GET  /shuffle/{job}/{task}/part-XXXX.jsonl`` — serve a shuffle partition to
   a reducer pulling it over HTTP;
 * ``POST /shuffle/cleanup/{job}`` — drop a job's local shuffle data;
@@ -118,6 +119,7 @@ class WorkerServer:
         app.add_url_rule("/tasks", "tasks", self._tasks, methods=["GET"])
         app.add_url_rule("/task/execute", "execute", self._execute, methods=["POST"])
         app.add_url_rule("/task/cancel", "cancel", self._cancel, methods=["POST"])
+        app.add_url_rule("/job/<job_id>/cancel", "job_cancel", self._cancel_job, methods=["POST"])
         app.add_url_rule(
             "/shuffle/<job_id>/<task_id>/<partition_name>",
             "shuffle", self._get_shuffle, methods=["GET"],
@@ -139,7 +141,16 @@ class WorkerServer:
         return jsonify(self.resource.sample())
 
     def _tasks(self):
-        return jsonify({"running": self.executor.running_task_ids()})
+        running = []
+        for key in self.executor.running_execution_keys():
+            parts = key.split(":", 3)
+            running.append({
+                "job_id": parts[0] if len(parts) > 0 else "",
+                "task_id": parts[1] if len(parts) > 1 else "",
+                "attempt": int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None,
+                "key": key,
+            })
+        return jsonify({"running": running})
 
     def _execute(self):
         spec = request.get_json(silent=True) or {}
@@ -156,8 +167,16 @@ class WorkerServer:
 
     def _cancel(self):
         body = request.get_json(silent=True) or {}
+        job_id = body.get("job_id", "")
         task_id = body.get("task_id", "")
-        return jsonify({"cancelled": self.executor.cancel(task_id) if task_id else False})
+        if not job_id or not task_id:
+            return jsonify({"cancelled": False, "error": "job_id and task_id are required"}), 400
+        cancelled = self.executor.cancel(job_id, task_id)
+        return jsonify({"cancelled": bool(cancelled), "job_id": job_id, "task_id": task_id})
+
+    def _cancel_job(self, job_id: str):
+        cancelled = self.executor.cancel(job_id)
+        return jsonify({"cancelled": cancelled, "job_id": job_id})
 
     def _get_shuffle(self, job_id: str, task_id: str, partition_name: str):
         index = parse_partition_index(partition_name)

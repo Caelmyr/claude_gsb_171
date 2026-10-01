@@ -34,7 +34,12 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, dict[str, Task]] = {}
         self._lock = threading.RLock()
+        self._terminal_handlers: list[Callable[[Job, list[Task]], None]] = []
         self._load()
+
+    def on_terminal(self, handler: Callable[[Job, list[Task]], None]) -> None:
+        """Register a callback invoked after a job enters a terminal state."""
+        self._terminal_handlers.append(handler)
 
     # ------------------------------------------------------------------
     # Persistence
@@ -165,11 +170,15 @@ class JobManager:
             self.save_job(job)
         return job
 
-    def apply_task(self, job_id: str, task_id: str, fn: Callable[[Task], None]) -> Optional[Task]:
+    def apply_task(self, job_id: str, task_id: str, fn: Callable[[Task], None],
+                   require_active_job: bool = False) -> Optional[Task]:
         """Run ``fn(task)`` under the manager lock and persist the result."""
         with self._lock:
+            job = self._jobs.get(job_id)
             task = self._tasks.get(job_id, {}).get(task_id)
-            if task is None:
+            if job is None or task is None:
+                return None
+            if require_active_job and (job.is_terminal or task.status in C.TASK_TERMINAL_STATES):
                 return None
             fn(task)
             task.last_update_ms = now_ms()
@@ -185,21 +194,99 @@ class JobManager:
             self.save_job(job)
             return job
 
-    def mark_task_dispatched(self, job: Job, task: Task, worker_id: str) -> None:
-        self.update_task(job.job_id, task.task_id,
-                         status=C.TASK_ASSIGNED, worker_id=worker_id,
-                         assigned_ms=now_ms(), attempts=task.attempts + 0)
+    def mark_task_dispatched(self, job: Job, task: Task, worker_id: str,
+                             speculative: bool = False) -> Optional[Task]:
+        """Record that a worker accepted a task.
+
+        Returns ``None`` if the job or task became terminal while the dispatch
+        HTTP request was in flight.  The caller must then cancel the work on the
+        worker instead of leaving an unmanaged process running.
+        """
+        with self._lock:
+            task = self._tasks.get(job.job_id, {}).get(task.task_id)
+            current_job = self._jobs.get(job.job_id)
+            if (task is None or current_job is None or current_job.is_terminal
+                    or task.status in C.TASK_TERMINAL_STATES):
+                return None
+            task.status = C.TASK_ASSIGNED
+            task.assigned_ms = now_ms()
+            if speculative:
+                stats = dict(task.stats or {})
+                stats.setdefault("speculative_workers", []).append(worker_id)
+                task.stats = stats
+            elif not task.worker_id:
+                task.worker_id = worker_id
+            task.last_update_ms = now_ms()
+            self.save_task(job.job_id, task)
+            return task
+
+    def terminate(self, job: Job, status: str, error: str = "") -> tuple[Optional[Job], list[Task]]:
+        """Atomically terminate a job and stop all of its still-open tasks.
+
+        Already completed tasks are preserved. Every pending, assigned, running
+        or retrying task is moved to a terminal state so it can neither be
+        scheduled nor counted as occupied node capacity.  The returned tasks are
+        the executions that remote workers may still need to kill.
+        """
+        if status not in C.JOB_TERMINAL_STATES:
+            raise ValueError(f"invalid terminal job status: {status!r}")
+
+        with self._lock:
+            current = self._jobs.get(job.job_id)
+            if current is None:
+                return None, []
+            if current.is_terminal:
+                return current, []
+
+            remote: list[Task] = []
+            now = now_ms()
+            for task in self._tasks.get(job.job_id, {}).values():
+                if task.status in C.TASK_TERMINAL_STATES:
+                    continue
+
+                if task.worker_id and task.status in (C.TASK_ASSIGNED, C.TASK_RUNNING):
+                    remote.append(task)
+
+                task_status = C.TASK_FAILED if status == C.JOB_FAILED and task.error else C.TASK_CANCELLED
+                task.status = task_status
+                task.finished_ms = now
+                task.last_update_ms = now
+                if task_status == C.TASK_CANCELLED:
+                    task.progress = 0.0
+                    task.error = error
+                elif error:
+                    task.error = task.error or error
+                task.retry_after_ms = 0
+                self.save_task(job.job_id, task)
+
+            current.status = status
+            if error:
+                current.error = error
+            if not current.finished_ms:
+                current.finished_ms = now_ms()
+            self.save_job(current)
+            terminal_job = current
+            remote_tasks = list(remote)
+
+        for handler in self._terminal_handlers:
+            try:
+                handler(terminal_job, remote_tasks)
+            except Exception:  # noqa: BLE001 - handlers must not roll back state
+                import traceback
+                traceback.print_exc()
+        return terminal_job, remote_tasks
 
     def cancel(self, job: Job) -> Job:
-        self.set_job_status(job, C.JOB_CANCELLED)
-        self.logbus.warn(job.job_id, "job cancelled", task_id="job")
-        return job
+        cancelled, _ = self.terminate(job, C.JOB_CANCELLED, "job cancelled")
+        if cancelled is not None:
+            self.logbus.warn(cancelled.job_id, "job cancelled; all open tasks stopped", task_id="job")
+        return cancelled or job
 
     def fail(self, job: Job, error: str) -> Job:
-        job.error = error
-        self.set_job_status(job, C.JOB_FAILED)
-        self.logbus.error(job.job_id, f"job failed: {error}", task_id="job")
-        return job
+        failed, _ = self.terminate(job, C.JOB_FAILED, error)
+        if failed is not None:
+            self.logbus.error(failed.job_id, f"job failed: {error}", task_id="job")
+        return failed or job
 
     # ------------------------------------------------------------------
     # Derived views
@@ -210,11 +297,12 @@ class JobManager:
         for stage, kind in ((C.STAGE_MAP, C.TASK_MAP), (C.STAGE_REDUCE, C.TASK_REDUCE)):
             stage_tasks = [t for t in tasks if t.kind == kind]
             counts = {C.TASK_PENDING: 0, C.TASK_ASSIGNED: 0, C.TASK_RUNNING: 0,
-                      C.TASK_RETRYING: 0, C.TASK_SUCCEEDED: 0, C.TASK_FAILED: 0}
+                      C.TASK_RETRYING: 0, C.TASK_SUCCEEDED: 0, C.TASK_FAILED: 0,
+                      C.TASK_CANCELLED: 0}
             for t in stage_tasks:
                 counts[t.status] = counts.get(t.status, 0) + 1
             total = len(stage_tasks)
-            done = counts[C.TASK_SUCCEEDED] + counts[C.TASK_RUNNING]
+            done = counts[C.TASK_SUCCEEDED]
             progress[stage] = {
                 "total": total,
                 "done": done,

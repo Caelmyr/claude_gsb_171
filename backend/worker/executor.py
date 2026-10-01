@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import shutil
 import threading
 import time
 import traceback
@@ -28,6 +29,7 @@ from typing import Any, Callable, Optional
 from backend.common import constants as C
 from backend.common.hashing import partition_for
 from backend.common.http_client import HttpClient
+from backend.common.ids import execution_key
 from backend.common.jsonutil import now_ms
 from backend.common.storage import atomic_write_json, read_json
 from backend.tasks.registry import get_mapper, get_reducer
@@ -36,12 +38,17 @@ from backend.worker.shuffle_store import SpillSorter, ShuffleStore, partition_fi
 ProgressCallback = Callable[[float, int, int], None]
 
 
+class TaskCancelled(Exception):
+    """Raised inside an execution after the Master requests cancellation."""
+
+
 # ---------------------------------------------------------------------------
 # Core algorithm (runs identically in a thread or a subprocess)
 # ---------------------------------------------------------------------------
 def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
     """Run a map task: mapper(records) -> hash-partitioned shuffle files."""
     mapper = get_mapper(spec["mapper"])
+    should_cancel = getattr(progress_cb, "should_cancel", None)
     store = ShuffleStore(data_root)
     records: list[Any] = spec.get("records", [])
     num_partitions = max(1, int(spec.get("partition_count", 1)))
@@ -56,12 +63,15 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
     emitted = 0
     chunk_size = 200
 
+    progress_cb(0.0, 0, 0)
     for i in range(0, len(records), chunk_size):
         chunk = records[i:i + chunk_size]
         for key, value in mapper(chunk, params):
             p = partition_for(key, num_partitions)
             buffers.setdefault(p, []).append((key, value))
             emitted += 1
+            if should_cancel is not None and emitted % 128 == 0 and should_cancel():
+                raise TaskCancelled("task cancelled")
         processed += len(chunk)
 
         # Spill a partition's buffer to disk once it outgrows the threshold so
@@ -86,6 +96,7 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
 def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
     """Run a reduce task: pull its partition from every mapper, sort, reduce."""
     reducer = get_reducer(spec["reducer"])
+    should_cancel = getattr(progress_cb, "should_cancel", None)
     params = spec.get("params", {}) or {}
     job_id = spec["job_id"]
     task_id = spec["task_id"]
@@ -99,6 +110,7 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
 
     fetched = 0
     total_sources = max(1, len(fetch_plan))
+    progress_cb(0.0, 0, 0)
     for idx, src in enumerate(fetch_plan):
         url = (
             f"{src['worker_url']}/shuffle/{job_id}/{src['map_task_id']}/"
@@ -110,17 +122,21 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
                 f"shuffle fetch failed for partition {partition} from {url}"
             )
         if isinstance(pairs, list):
-            for rec in pairs:
+            for rec_num, rec in enumerate(pairs, 1):
                 if isinstance(rec, (list, tuple)) and len(rec) >= 2:
                     sorter.add(rec[0], rec[1])
                     fetched += 1
+                if rec_num % 100 == 0:
+                    progress_cb(min(1.0, (idx + 1) / total_sources), fetched, 0)
+                    if should_cancel is not None and should_cancel():
+                        raise TaskCancelled("task cancelled")
         progress_cb(min(1.0, (idx + 1) / total_sources), fetched, 0)
 
     # Group the externally-sorted stream by key and run the reducer per group.
     results: list[dict] = []
     prev_key: Any = None
     values: list[Any] = []
-    for key, value in sorter.iter_sorted():
+    for item_num, (key, value) in enumerate(sorter.iter_sorted(), 1):
         if prev_key is None or key != prev_key:
             if prev_key is not None:
                 results.append(reducer(prev_key, values, params))
@@ -128,7 +144,11 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
             values = [value]
         else:
             values.append(value)
-    if prev_key is not None and len(results) < 0:
+        if item_num % 100 == 0:
+            progress_cb(1.0, fetched, len(results))
+            if should_cancel is not None and should_cancel():
+                raise TaskCancelled("task cancelled")
+    if prev_key is not None:
         results.append(reducer(prev_key, values, params))
 
     return {
@@ -165,6 +185,11 @@ def _execute_in_process(spec: dict, data_root: str, progress_path: str,
         result = _execute_task(spec, data_root, progress_cb)
         result["status"] = C.TASK_SUCCEEDED
         atomic_write_json(result_path, result)
+    except TaskCancelled as exc:
+        atomic_write_json(result_path, {
+            "status": C.TASK_CANCELLED,
+            "error": str(exc) or "cancelled",
+        })
     except Exception as exc:  # noqa: BLE001 - the result must always be reported
         atomic_write_json(result_path, {
             "status": C.TASK_FAILED,
@@ -199,6 +224,13 @@ class Executor:
         os.makedirs(self._tmp_dir, exist_ok=True)
 
     # -- bookkeeping --------------------------------------------------
+    @staticmethod
+    def _key(spec: dict) -> str:
+        attempt = spec.get("attempt")
+        replica = spec.get("execution_id", "")
+        return execution_key(spec["job_id"], spec["task_id"],
+                             attempt if attempt is not None else None, replica)
+
     @property
     def running_count(self) -> int:
         with self._lock:
@@ -206,66 +238,106 @@ class Executor:
 
     def running_task_ids(self) -> list[str]:
         with self._lock:
+            return [handle["spec"].get("task_id", key.rsplit(":", 1)[-1])
+                    for key, handle in self._handles.items()]
+
+    def running_execution_keys(self, job_id: str = "") -> list[str]:
+        with self._lock:
+            if job_id:
+                prefix = f"{job_id}:"
+                return [key for key in self._handles if key.startswith(prefix)]
             return list(self._handles.keys())
 
     # -- dispatch -----------------------------------------------------
     def start_task(self, spec: dict) -> bool:
         task_id = spec["task_id"]
+        job_id = spec["job_id"]
+        key = self._key(spec)
         # Inject config-derived execution parameters so the Master does not need
         # to know worker-local tuning (spill threshold, temp directory).
         spec = dict(spec)
         spec.setdefault("spill_records", int(getattr(self.config, "shuffle_spill_records", 20000)))
         spec.setdefault("tmp_dir", self._tmp_dir)
         with self._lock:
-            if task_id in self._handles:
+            if key in self._handles:
                 return False
-            self._handles[task_id] = {
+            self._handles[key] = {
+                "key": key,
                 "spec": spec,
                 "started_ms": now_ms(),
                 "cancel": threading.Event(),
                 "last_status_ms": 0,
             }
         runner = self._run_process if self.exec_mode == "process" else self._run_thread
-        threading.Thread(target=runner, args=(task_id,), daemon=True, name=f"task-{task_id}").start()
+        threading.Thread(target=runner, args=(key,), daemon=True, name=f"task-{key}").start()
         return True
 
-    def cancel(self, task_id: str) -> bool:
+    def cancel(self, job_id: str, task_id: str = "") -> int:
+        """Cancel one task, or every running task in a job when task_id is empty."""
+        if not job_id:
+            return 0
         with self._lock:
-            handle = self._handles.get(task_id)
-        if handle:
+            base = execution_key(job_id, task_id)
+            if task_id:
+                keys = [key for key in self._handles if key == base or key.startswith(base + ":")]
+            else:
+                prefix = f"{job_id}:"
+                keys = [key for key in list(self._handles) if key.startswith(prefix)]
+            handles = [self._handles[key] for key in keys]
+        for handle in handles:
             handle["cancel"].set()
-            return True
-        return False
+        return len(handles)
 
     def shutdown(self) -> None:
-        for task_id in self.running_task_ids():
-            self.cancel(task_id)
+        for key in self.running_execution_keys():
+            job_id = key.split(":", 1)[0]
+            self.cancel(job_id)
 
     # -- thread backend ----------------------------------------------
-    def _run_thread(self, task_id: str) -> None:
-        handle = self._handles[task_id]
+    def _run_thread(self, key: str) -> None:
+        with self._lock:
+            handle = self._handles.get(key)
+        if handle is None:
+            return
         spec = handle["spec"]
 
         def progress_cb(progress: float, processed: int, emitted: int) -> None:
+            if handle["cancel"].is_set():
+                raise TaskCancelled("task cancelled")
             self._post_status(spec, handle, progress, processed, emitted)
+
+        def should_cancel() -> bool:
+            return handle["cancel"].is_set()
+
+        progress_cb.should_cancel = should_cancel
 
         try:
             result = _execute_task(spec, self.data_root, progress_cb)
-            result["status"] = C.TASK_SUCCEEDED
-            self._complete(task_id, result)
+            if handle["cancel"].is_set():
+                result = {"status": C.TASK_CANCELLED, "error": "cancelled"}
+            else:
+                result["status"] = C.TASK_SUCCEEDED
+        except TaskCancelled:
+            result = {"status": C.TASK_CANCELLED, "error": "cancelled"}
         except Exception as exc:  # noqa: BLE001
-            self._complete(task_id, {
+            result = {
                 "status": C.TASK_FAILED,
                 "error": f"{type(exc).__name__}: {exc}",
-            })
-        finally:
-            self._remove(task_id)
+            }
+
+        self._remove(key)
+        # Report after releasing the worker slot: the Master's HTTP client can
+        # block during Master restarts, and reporting must not keep capacity busy.
+        self._complete(key, result, handle)
 
     # -- process backend ---------------------------------------------
-    def _run_process(self, task_id: str) -> None:
-        handle = self._handles[task_id]
+    def _run_process(self, key: str) -> None:
+        with self._lock:
+            handle = self._handles.get(key)
+        if handle is None:
+            return
         spec = handle["spec"]
-        work_dir = os.path.join(self._tmp_dir, f"task-{task_id}-{now_ms()}")
+        work_dir = os.path.join(self._tmp_dir, f"task-{key.replace(':', '-')}-{now_ms()}")
         os.makedirs(work_dir, exist_ok=True)
         progress_path = os.path.join(work_dir, "progress.json")
         result_path = os.path.join(work_dir, "result.json")
@@ -277,7 +349,7 @@ class Executor:
         proc = ctx.Process(
             target=_execute_in_process,
             args=(spec, self.data_root, progress_path, result_path),
-            name=f"mr-{task_id}",
+            name=f"mr-{key}",
         )
         proc.start()
 
@@ -285,8 +357,12 @@ class Executor:
             if handle["cancel"].is_set():
                 proc.terminate()
                 proc.join(timeout=2.0)
-                self._complete(task_id, {"status": C.TASK_FAILED, "error": "cancelled"})
-                self._remove(task_id)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=2.0)
+                shutil.rmtree(work_dir, ignore_errors=True)
+                self._remove(key)
+                self._complete(key, {"status": C.TASK_CANCELLED, "error": "cancelled"}, handle)
                 return
             time.sleep(0.25)
             prog = read_json(progress_path)
@@ -296,8 +372,9 @@ class Executor:
         proc.join()
 
         result = read_json(result_path, default={"status": C.TASK_FAILED, "error": "no result file"})
-        self._complete(task_id, result)
-        self._remove(task_id)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        self._remove(key)
+        self._complete(key, result, handle)
 
     # -- reporting to master -----------------------------------------
     def _post(self, path: str, payload: dict) -> None:
@@ -310,6 +387,8 @@ class Executor:
 
     def _post_status(self, spec: dict, handle: dict, progress: float,
                      processed: int, emitted: int) -> None:
+        if handle["cancel"].is_set():
+            return
         now = now_ms()
         if now - handle.get("last_status_ms", 0) < 300:
             return
@@ -324,23 +403,23 @@ class Executor:
             "records_emitted": emitted,
         })
 
-    def _complete(self, task_id: str, result: dict) -> None:
-        handle = self._handles.get(task_id)
+    def _complete(self, key: str, result: dict, handle: Optional[dict] = None) -> None:
         spec = handle["spec"] if handle else {}
+        started_ms = handle["started_ms"] if handle else 0
         self._post("/api/workers/task-complete", {
             "worker_id": self.worker_id,
             "job_id": spec.get("job_id", ""),
-            "task_id": task_id,
+            "task_id": spec.get("task_id", ""),
             "kind": spec.get("kind", ""),
             "status": result.get("status", C.TASK_FAILED),
             "records_processed": result.get("records_processed", 0),
             "records_emitted": result.get("records_emitted", 0),
-            "duration_ms": int((now_ms() - handle["started_ms"]) / 1000) if handle else 0,
+            "duration_ms": int((now_ms() - started_ms) / 1000) if started_ms else 0,
             "partition_sizes": result.get("partition_sizes", {}),
             "results": result.get("results", []),
             "error": result.get("error", ""),
         })
 
-    def _remove(self, task_id: str) -> None:
+    def _remove(self, key: str) -> None:
         with self._lock:
-            self._handles.pop(task_id, None)
+            self._handles.pop(key, None)

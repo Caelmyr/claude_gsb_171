@@ -34,9 +34,10 @@ TASK_RUNNING = "RUNNING"
 TASK_SUCCEEDED = "SUCCEEDED"
 TASK_FAILED = "FAILED"         # permanently failed after max attempts
 TASK_RETRYING = "RETRYING"     # failed, waiting to be re-dispatched
+TASK_CANCELLED = "CANCELLED"   # stopped because its job reached a terminal state
 
 TASK_ACTIVE_STATES = {TASK_ASSIGNED, TASK_RUNNING, TASK_RETRYING}
-TASK_TERMINAL_STATES = {TASK_SUCCEEDED, TASK_FAILED}
+TASK_TERMINAL_STATES = {TASK_SUCCEEDED, TASK_FAILED, TASK_CANCELLED}
 
 # ---------------------------------------------------------------------------
 # Stage names (also used as directory names in the JSON store)
@@ -90,6 +91,7 @@ STATE_LABELS = {
     TASK_SUCCEEDED: "成功 Succeeded",
     TASK_FAILED: "失败 Failed",
     TASK_RETRYING: "重试中 Retrying",
+    TASK_CANCELLED: "已取消 Cancelled",
     WORKER_ALIVE: "存活 Alive",
     WORKER_DEAD: "失联 Dead",
 }

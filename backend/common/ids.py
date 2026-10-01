@@ -36,6 +36,23 @@ def task_id(kind: str, index: int) -> str:
     return f"{kind}-{index:04d}"
 
 
+def execution_key(job_id: str, task_id: str, attempt: int | None = None,
+                  replica: str = "") -> str:
+    """Worker-local key for one task execution.
+
+    Task ids are deliberately deterministic *within a job*; prefixing the job id
+    makes cancellation target the correct execution when several jobs run on one
+    worker. Including the attempt keeps a stale retry process separate from the
+    newly dispatched attempt.
+    """
+    key = f"{job_id}:{task_id}"
+    if attempt is not None:
+        key = f"{key}:{int(attempt)}"
+    if replica:
+        key = f"{key}:{replica}"
+    return key
+
+
 def shard_id(kind: str, index: int) -> str:
     """Deterministic shard id: ``in-0002``, ``map-0002``, ``red-0000``."""
     return f"{kind}-{index:04d}"

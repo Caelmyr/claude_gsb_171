@@ -64,30 +64,57 @@ class FaultTolerance:
     # ------------------------------------------------------------------
     def handle_task_failure(self, job: Job, task: Task, error: str, worker_id: str = "") -> bool:
         """Return True if the task was queued for retry, False if the job is doomed."""
+        # Another failure can terminate the whole job while a duplicate/old attempt
+        # report is in flight; never resurrect or reschedule a terminal job.
+        current_job = self.job_manager.get_job(job.job_id)
+        if current_job is None or current_job.is_terminal:
+            return False
+        job = current_job
         max_attempts = int(self.config.max_attempts)
         if task.attempts < max_attempts:
             backoff_ms = int(self.config.retry_backoff_base_sec * (2 ** task.attempts))
+            next_attempts = task.attempts + 1
+            retry_after_ms = now_ms() + backoff_ms
+
+            def queue_retry(t: Task) -> None:
+                t.status = C.TASK_RETRYING
+                t.worker_id = None
+                t.error = error
+                t.attempts = next_attempts
+                t.retry_after_ms = retry_after_ms
+                t.progress = 0.0
+                t.records_processed = 0
+                t.records_emitted = 0
+
+            queued = self.job_manager.apply_task(
+                job.job_id, task.task_id, queue_retry, require_active_job=True,
+            )
+            if queued is None:
+                return False
             self._record(
                 job, "task_failed", f"task {task.task_id} failed ({error}); retrying",
-                task=task, worker_id=worker_id,
-                detail={"attempt": task.attempts + 1, "max_attempts": max_attempts,
+                task=queued, worker_id=worker_id,
+                detail={"attempt": next_attempts, "max_attempts": max_attempts,
                         "backoff_ms": backoff_ms},
-            )
-            self.job_manager.update_task(
-                job.job_id, task.task_id,
-                status=C.TASK_RETRYING, worker_id=None, error=error,
-                attempts=task.attempts + 1,
-                retry_after_ms=now_ms() + backoff_ms,
-                progress=0.0, records_processed=0, records_emitted=0,
             )
             return True
 
+        final_attempts = task.attempts + 1
+
+        def mark_failed(t: Task) -> None:
+            t.status = C.TASK_FAILED
+            t.error = error
+            t.attempts = final_attempts
+
+        failed = self.job_manager.apply_task(
+            job.job_id, task.task_id, mark_failed, require_active_job=True,
+        )
+        if failed is None:
+            return False
         self._record(
             job, "task_failed", f"task {task.task_id} exhausted {max_attempts} attempts",
-            task=task, worker_id=worker_id,
+            task=failed, worker_id=worker_id,
         )
-        self.job_manager.update_task(job.job_id, task.task_id, status=C.TASK_FAILED,
-                                     error=error, attempts=task.attempts + 1)
         self.job_manager.fail(job, f"task {task.task_id} failed after {max_attempts} attempts: {error}")
         return False
 
@@ -98,17 +125,31 @@ class FaultTolerance:
             if job.is_terminal:
                 continue
             for task in self.job_manager.tasks_for(job.job_id):
-                if task.worker_id == worker.worker_id and task.status in C.TASK_ACTIVE_STATES:
+                speculative_workers = list((task.stats or {}).get("speculative_workers", []))
+                on_dead_worker = (
+                    task.worker_id == worker.worker_id
+                    or worker.worker_id in speculative_workers
+                )
+                if on_dead_worker and task.status in C.TASK_ACTIVE_STATES:
                     self._record(
                         job, "worker_dead",
                         f"worker {worker.name} lost; reassigning task {task.task_id}",
                         task=task, worker_id=worker.worker_id,
                     )
-                    self.job_manager.update_task(
-                        job.job_id, task.task_id,
-                        status=C.TASK_RETRYING, worker_id=None,
-                        error=f"worker {worker.name} died", retry_after_ms=0,
-                    )
+
+                    def reassign(t: Task, worker_id=worker.worker_id) -> None:
+                        if t.worker_id == worker_id:
+                            t.worker_id = None
+                        stats = dict(t.stats or {})
+                        stats["speculative_workers"] = [
+                            wid for wid in stats.get("speculative_workers", []) if wid != worker_id
+                        ]
+                        t.stats = stats
+                        t.status = C.TASK_RETRYING
+                        t.error = f"worker {worker.name} died"
+                        t.retry_after_ms = 0
+
+                    self.job_manager.apply_task(job.job_id, task.task_id, reassign)
                     reassigned += 1
         return reassigned
 
